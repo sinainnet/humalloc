@@ -62,7 +62,7 @@ namespace tcmalloc {
 //						return &pageheap_lock_[i];
 //					}
 //				}
-				pageheap_rank = thread_id % 5;
+				pageheap_rank = thread_id % 8;
 //				Log(kLog, __FILE__, __LINE__,
 //												"------------ pageheap rank requsted: ", pageheap_rank
 //					 );
@@ -126,7 +126,7 @@ namespace tcmalloc {
 			// imperfectly. Thus we keep those unhidden for now. Thankfully
 			// they're not performance-critical.
 			/* ATTRIBUTE_HIDDEN */ static bool inited_;
-			static const int pageheap_count = 5;
+			static const int pageheap_count = 8;
 			/* ATTRIBUTE_HIDDEN */ static SpinLock pageheap_lock_[pageheap_count];
 			/* ATTRIBUTE_HIDDEN */ static SpinLock extended_lock_;
 
