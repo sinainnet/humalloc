@@ -97,9 +97,10 @@ namespace tcmalloc {
 //        );
 
 		if (n > 1){
+
+						Log(kLog, __FILE__, __LINE__, "lage span requested (>512kb) : 512 * ", n);
 						SpinLockHolder h(Static::extended_lock());
 						Span* large_span = Static::extended_memory()->AllocLarge(n);
-						//Log(kLog, __FILE__, __LINE__, "lage span length: ", large_span->length, large_span->sizeclass);
 						large_span->location = Span::IN_USE;
 						return large_span;
 		}
