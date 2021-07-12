@@ -34,289 +34,338 @@
 #include "config.h"
 #include <algorithm>
 #include "central_freelist.h"
-#include "internal_logging.h"  // for ASSERT, MESSAGE
-#include "linked_list.h"       // for SLL_Next, SLL_Push, etc
-#include "page_heap.h"         // for PageHeap
-#include "static_vars.h"       // for Static
+#include "internal_logging.h" // for ASSERT, MESSAGE
+#include "linked_list.h"	  // for SLL_Next, SLL_Push, etc
+#include "page_heap.h"		  // for PageHeap
+#include "static_vars.h"	  // for Static
 #include <sys/syscall.h>
 #include <chrono>
 
-using std::min;
 using std::max;
+using std::min;
 
-namespace tcmalloc {
+namespace tcmalloc
+{
 
-				void CentralFreeList::Init(size_t cl) {
-								size_class_ = cl;
-								tcmalloc::DLL_Init(&empty_);
-								tcmalloc::DLL_Init(&nonempty_);
-								num_spans_ = 0;
-								counter_ = 0;
+	void CentralFreeList::Init(size_t cl)
+	{
+		size_class_ = cl;
+		tcmalloc::DLL_Init(&empty_);
+		tcmalloc::DLL_Init(&nonempty_);
+		num_spans_ = 0;
+		counter_ = 0;
 
-								max_cache_size_ = kMaxNumTransferEntries;
+		max_cache_size_ = kMaxNumTransferEntries;
 #ifdef TCMALLOC_SMALL_BUT_SLOW
-								// Disable the transfer cache for the small footprint case.
-								cache_size_ = 0;
+		// Disable the transfer cache for the small footprint case.
+		cache_size_ = 0;
 #else
-								cache_size_ = 16;
+		cache_size_ = 16;
 #endif
-								if (cl > 0) {
-												// Limit the maximum size of the cache based on the size class.  If this
-												// is not done, large size class objects will consume a lot of memory if
-												// they just sit in the transfer cache.
-												int32_t bytes = Static::sizemap()->ByteSizeForClass(cl);
-												int32_t objs_to_move = Static::sizemap()->num_objects_to_move(cl);
+		if (cl > 0)
+		{
+			// Limit the maximum size of the cache based on the size class.  If this
+			// is not done, large size class objects will consume a lot of memory if
+			// they just sit in the transfer cache.
+			int32_t bytes = Static::sizemap()->ByteSizeForClass(cl);
+			int32_t objs_to_move = Static::sizemap()->num_objects_to_move(cl);
 
-												ASSERT(objs_to_move > 0 && bytes > 0);
-												// Limit each size class cache to at most 1MB of objects or one entry,
-												// whichever is greater. Total transfer cache memory used across all
-												// size classes then can't be greater than approximately
-												// 1MB * kMaxNumTransferEntries.
-												// min and max are in parens to avoid macro-expansion on windows.
-												max_cache_size_ = (min)(max_cache_size_,
-																				(max)(1, (1024 * 1024) / (bytes * objs_to_move)));
-												cache_size_ = (min)(cache_size_, max_cache_size_);
-								}
-								used_slots_ = 0;
-								ASSERT(cache_size_ <= max_cache_size_);
-				}
+			ASSERT(objs_to_move > 0 && bytes > 0);
+			// Limit each size class cache to at most 1MB of objects or one entry,
+			// whichever is greater. Total transfer cache memory used across all
+			// size classes then can't be greater than approximately
+			// 1MB * kMaxNumTransferEntries.
+			// min and max are in parens to avoid macro-expansion on windows.
+			max_cache_size_ = (min)(max_cache_size_,
+									(max)(1, (1024 * 1024) / (bytes * objs_to_move)));
+			cache_size_ = (min)(cache_size_, max_cache_size_);
+		}
+		used_slots_ = 0;
+		ASSERT(cache_size_ <= max_cache_size_);
+	}
 
-				void CentralFreeList::ReleaseListToSpans(void* start) {
-								while (start) {
-												void *next = SLL_Next(start);
-												ReleaseToSpans(start);
-												start = next;
-								}
-				}
+	void CentralFreeList::ReleaseListToSpans(void *start)
+	{
+		while (start)
+		{
+			void *next = SLL_Next(start);
+			ReleaseToSpans(start);
+			start = next;
+		}
+	}
 
-				// MapObjectToSpan should logically be part of ReleaseToSpans.  But
-				// this triggers an optimization bug in gcc 4.5.0.  Moving to a
-				// separate function, and making sure that function isn't inlined,
-				// seems to fix the problem.  It also should be fixed for gcc 4.5.1.
-				static
+	// MapObjectToSpan should logically be part of ReleaseToSpans.  But
+	// this triggers an optimization bug in gcc 4.5.0.  Moving to a
+	// separate function, and making sure that function isn't inlined,
+	// seems to fix the problem.  It also should be fixed for gcc 4.5.1.
+	static
 #if __GNUC__ == 4 && __GNUC_MINOR__ == 5 && __GNUC_PATCHLEVEL__ == 0
-								__attribute__ ((noinline))
+		__attribute__((noinline))
 #endif
-								Span* MapObjectToSpan(void* object) {
-												const PageID p = reinterpret_cast<uintptr_t>(object) >> kPageShift;
-												Span* span = Static::pagemap()->GetDescriptor(p);
-												return span;
-								}
+		Span *
+		MapObjectToSpan(void *object)
+	{
+		const PageID p = reinterpret_cast<uintptr_t>(object) >> kPageShift;
+		Span *span = Static::pagemap()->GetDescriptor(p);
+		return span;
+	}
 
-				void CentralFreeList::ReleaseToSpans(void* object) {
+	void CentralFreeList::ReleaseToSpans(void *object)
+	{
 
-								Span* span = MapObjectToSpan(object);
-								ASSERT(span != NULL);
-								ASSERT(span->refcount > 0);
+		Span *span = MapObjectToSpan(object);
+		ASSERT(span != NULL);
+		ASSERT(span->refcount > 0);
 
-								// If span is empty, move it to non-empty list
-								if (span->objects == NULL) {
-												tcmalloc::DLL_Remove(span);
-												tcmalloc::DLL_Prepend(&nonempty_, span);
-												Event(span, 'N', 0);
-								}
+		// If span is empty, move it to non-empty list
+		if (span->objects == NULL)
+		{
+			tcmalloc::DLL_Remove(span);
+			tcmalloc::DLL_Prepend(&nonempty_, span);
+			Event(span, 'N', 0);
+		}
 
-								// The following check is expensive, so it is disabled by default
-								if (false) {
-												// Check that object does not occur in list
-												int got = 0;
-												for (void* p = span->objects; p != NULL; p = *((void**) p)) {
-																ASSERT(p != object);
-																got++;
-												}
-												ASSERT(got + span->refcount ==
-																				(span->length<<kPageShift) /
-																				Static::sizemap()->ByteSizeForClass(span->sizeclass));
-								}
+		// The following check is expensive, so it is disabled by default
+		if (false)
+		{
+			// Check that object does not occur in list
+			int got = 0;
+			for (void *p = span->objects; p != NULL; p = *((void **)p))
+			{
+				ASSERT(p != object);
+				got++;
+			}
+			ASSERT(got + span->refcount ==
+				   (span->length << kPageShift) /
+					   Static::sizemap()->ByteSizeForClass(span->sizeclass));
+		}
 
-								counter_++;
-								span->refcount--;
-								if (span->refcount == 0) {
-												Event(span, '#', 0);
-												counter_ -= ((span->length<<kPageShift) /
-																				Static::sizemap()->ByteSizeForClass(span->sizeclass));
-												tcmalloc::DLL_Remove(span);
-												--num_spans_;
+		counter_++;
+		span->refcount--;
+		if (span->refcount == 0)
+		{
+			Event(span, '#', 0);
+			counter_ -= ((span->length << kPageShift) /
+						 Static::sizemap()->ByteSizeForClass(span->sizeclass));
+			tcmalloc::DLL_Remove(span);
+			--num_spans_;
 
-												// Release central list lock while operating on pageheap
-												lock_.Unlock();
-												{
-																int pageheap_rank;
-																SpinLockHolder h(Static::pageheap_lock(pageheap_rank));
-																Static::pageheap(pageheap_rank)->AppendSpantoPageHeap(span);
-												}
-												lock_.Lock();
-								} else {
-												*(reinterpret_cast<void**>(object)) = span->objects;
-												span->objects = object;
-								}
-				}
+			// Release central list lock while operating on pageheap
+			lock_.Unlock();
+			{
+				int pageheap_rank;
+				SpinLockHolder h(Static::pageheap_lock(pageheap_rank));
+				Static::pageheap(pageheap_rank)->AppendSpantoPageHeap(span);
+			}
+			lock_.Lock();
+		}
+		else
+		{
+			*(reinterpret_cast<void **>(object)) = span->objects;
+			span->objects = object;
+		}
+	}
 
-				bool CentralFreeList::EvictRandomSizeClass(
-												int locked_size_class, bool force) {
-								static int race_counter = 0;
-								int t = race_counter++;  // Updated without a lock, but who cares.
-								if (t >= Static::num_size_classes()) {
-												while (t >= Static::num_size_classes()) {
-																t -= Static::num_size_classes();
-												}
-												race_counter = t;
-								}
-								ASSERT(t >= 0);
-								ASSERT(t < Static::num_size_classes());
-								if (t == locked_size_class) return false;
-								return Static::central_cache()[t].ShrinkCache(locked_size_class, force);
-				}
+	bool CentralFreeList::EvictRandomSizeClass(
+		int locked_size_class, bool force)
+	{
+		static int race_counter = 0;
+		int t = race_counter++; // Updated without a lock, but who cares.
+		if (t >= Static::num_size_classes())
+		{
+			while (t >= Static::num_size_classes())
+			{
+				t -= Static::num_size_classes();
+			}
+			race_counter = t;
+		}
+		ASSERT(t >= 0);
+		ASSERT(t < Static::num_size_classes());
+		if (t == locked_size_class)
+			return false;
+		return Static::central_cache()[t].ShrinkCache(locked_size_class, force);
+	}
 
-				bool CentralFreeList::MakeCacheSpace() {
-								// Is there room in the cache?
-								if (used_slots_ < cache_size_) return true;
-								// Check if we can expand this cache?
-								if (cache_size_ == max_cache_size_) return false;
-								// Ok, we'll try to grab an entry from some other size class.
-								if (EvictRandomSizeClass(size_class_, false) ||
-																EvictRandomSizeClass(size_class_, true)) {
-												// Succeeded in evicting, we're going to make our cache larger.
-												// However, we may have dropped and re-acquired the lock in
-												// EvictRandomSizeClass (via ShrinkCache and the LockInverter), so the
-												// cache_size may have changed.  Therefore, check and verify that it is
-												// still OK to increase the cache_size.
-												if (cache_size_ < max_cache_size_) {
-																cache_size_++;
-																return true;
-												}
-								}
-								return false;
-				}
+	bool CentralFreeList::MakeCacheSpace()
+	{
+		// Is there room in the cache?
+		if (used_slots_ < cache_size_)
+			return true;
+		// Check if we can expand this cache?
+		if (cache_size_ == max_cache_size_)
+			return false;
+		// Ok, we'll try to grab an entry from some other size class.
+		if (EvictRandomSizeClass(size_class_, false) ||
+			EvictRandomSizeClass(size_class_, true))
+		{
+			// Succeeded in evicting, we're going to make our cache larger.
+			// However, we may have dropped and re-acquired the lock in
+			// EvictRandomSizeClass (via ShrinkCache and the LockInverter), so the
+			// cache_size may have changed.  Therefore, check and verify that it is
+			// still OK to increase the cache_size.
+			if (cache_size_ < max_cache_size_)
+			{
+				cache_size_++;
+				return true;
+			}
+		}
+		return false;
+	}
 
+	namespace
+	{
+		class LockInverter
+		{
+		private:
+			SpinLock *held_, *temp_;
 
-				namespace {
-								class LockInverter {
-												private:
-																SpinLock *held_, *temp_;
-												public:
-																inline explicit LockInverter(SpinLock* held, SpinLock *temp)
-																				: held_(held), temp_(temp) { held_->Unlock(); temp_->Lock(); }
-																inline ~LockInverter() { temp_->Unlock(); held_->Lock();  }
-								};
-				}
+		public:
+			inline explicit LockInverter(SpinLock *held, SpinLock *temp)
+				: held_(held), temp_(temp)
+			{
+				held_->Unlock();
+				temp_->Lock();
+			}
+			inline ~LockInverter()
+			{
+				temp_->Unlock();
+				held_->Lock();
+			}
+		};
+	}
 
-				// This function is marked as NO_THREAD_SAFETY_ANALYSIS because it uses
-				// LockInverter to release one lock and acquire another in scoped-lock
-				// style, which our current annotation/analysis does not support.
-				bool CentralFreeList::ShrinkCache(int locked_size_class, bool force)
-								NO_THREAD_SAFETY_ANALYSIS {
-												// Start with a quick check without taking a lock.
-												if (cache_size_ == 0) return false;
-												// We don't evict from a full cache unless we are 'forcing'.
-												if (force == false && used_slots_ == cache_size_) return false;
+	// This function is marked as NO_THREAD_SAFETY_ANALYSIS because it uses
+	// LockInverter to release one lock and acquire another in scoped-lock
+	// style, which our current annotation/analysis does not support.
+	bool CentralFreeList::ShrinkCache(int locked_size_class, bool force)
+		NO_THREAD_SAFETY_ANALYSIS
+	{
+		// Start with a quick check without taking a lock.
+		if (cache_size_ == 0)
+			return false;
+		// We don't evict from a full cache unless we are 'forcing'.
+		if (force == false && used_slots_ == cache_size_)
+			return false;
 
-												// Grab lock, but first release the other lock held by this thread.  We use
-												// the lock inverter to ensure that we never hold two size class locks
-												// concurrently.  That can create a deadlock because there is no well
-												// defined nesting order.
-												LockInverter li(&Static::central_cache()[locked_size_class].lock_, &lock_);
-												ASSERT(used_slots_ <= cache_size_);
-												ASSERT(0 <= cache_size_);
-												if (cache_size_ == 0) return false;
-												if (used_slots_ == cache_size_) {
-																if (force == false) return false;
-																// ReleaseListToSpans releases the lock, so we have to make all the
-																// updates to the central list before calling it.
-																cache_size_--;
-																used_slots_--;
-																ReleaseListToSpans(tc_slots_[used_slots_].head);
-																return true;
-												}
-												cache_size_--;
-												return true;
-								}
+		// Grab lock, but first release the other lock held by this thread.  We use
+		// the lock inverter to ensure that we never hold two size class locks
+		// concurrently.  That can create a deadlock because there is no well
+		// defined nesting order.
+		LockInverter li(&Static::central_cache()[locked_size_class].lock_, &lock_);
+		ASSERT(used_slots_ <= cache_size_);
+		ASSERT(0 <= cache_size_);
+		if (cache_size_ == 0)
+			return false;
+		if (used_slots_ == cache_size_)
+		{
+			if (force == false)
+				return false;
+			// ReleaseListToSpans releases the lock, so we have to make all the
+			// updates to the central list before calling it.
+			cache_size_--;
+			used_slots_--;
+			ReleaseListToSpans(tc_slots_[used_slots_].head);
+			return true;
+		}
+		cache_size_--;
+		return true;
+	}
 
-				void CentralFreeList::InsertRange(void *start, void *end, int N) {
-								SpinLockHolder h(&lock_);
-								if (N == Static::sizemap()->num_objects_to_move(size_class_) &&
-																MakeCacheSpace()) {
-												int slot = used_slots_++;
-												ASSERT(slot >=0);
-												ASSERT(slot < max_cache_size_);
-												TCEntry *entry = &tc_slots_[slot];
-												entry->head = start;
-												entry->tail = end;
-												return;
-								}
-								ReleaseListToSpans(start);
-				}
+	void CentralFreeList::InsertRange(void *start, void *end, int N)
+	{
+		SpinLockHolder h(&lock_);
+		if (N == Static::sizemap()->num_objects_to_move(size_class_) &&
+			MakeCacheSpace())
+		{
+			int slot = used_slots_++;
+			ASSERT(slot >= 0);
+			ASSERT(slot < max_cache_size_);
+			TCEntry *entry = &tc_slots_[slot];
+			entry->head = start;
+			entry->tail = end;
+			return;
+		}
+		ReleaseListToSpans(start);
+	}
 
-				int CentralFreeList::RemoveRange(void **start, void **end, int N) {
-								ASSERT(N > 0);
-								lock_.Lock();
-								if (N == Static::sizemap()->num_objects_to_move(size_class_) &&
-																used_slots_ > 0) {
-												int slot = --used_slots_;
-												ASSERT(slot >= 0);
-												TCEntry *entry = &tc_slots_[slot];
-												*start = entry->head;
-												*end = entry->tail;
-												lock_.Unlock();
-												return N;
-								}
+	int CentralFreeList::RemoveRange(void **start, void **end, int N)
+	{
+		ASSERT(N > 0);
+		lock_.Lock();
+		if (N == Static::sizemap()->num_objects_to_move(size_class_) &&
+			used_slots_ > 0)
+		{
+			int slot = --used_slots_;
+			ASSERT(slot >= 0);
+			TCEntry *entry = &tc_slots_[slot];
+			*start = entry->head;
+			*end = entry->tail;
+			lock_.Unlock();
+			return N;
+		}
 
-								int result = 0;
-								*start = NULL;
-								*end = NULL;
-								// TODO: Prefetch multiple TCEntries?
+		int result = 0;
+		*start = NULL;
+		*end = NULL;
+		// TODO: Prefetch multiple TCEntries?
 
-								/*
+		/*
 									 >>> for flowchart 7 goto implementation of FetchFromOneSpansSafe
 									 >>> in this file.
 								 */
-								result = FetchFromOneSpansSafe(N, start, end);
-								if (result != 0) {
-												while (result < N) {
-																int n;
-																void* head = NULL;
-																void* tail = NULL;
-																n = FetchFromOneSpans(N - result, &head, &tail);
-																if (!n) break;
-																result += n;
-																SLL_PushRange(start, head, tail);
-												}
-								}
-								lock_.Unlock();
-								return result;
-				}
+		result = FetchFromOneSpansSafe(N, start, end);
+		if (result != 0)
+		{
+			while (result < N)
+			{
+				int n;
+				void *head = NULL;
+				void *tail = NULL;
+				n = FetchFromOneSpans(N - result, &head, &tail);
+				if (!n)
+					break;
+				result += n;
+				SLL_PushRange(start, head, tail);
+			}
+		}
+		lock_.Unlock();
+		return result;
+	}
 
+	int CentralFreeList::FetchFromOneSpansSafe(int N, void **start, void **end)
+	{
 
-				int CentralFreeList::FetchFromOneSpansSafe(int N, void **start, void **end) {
-
-								/*
+		/*
 									 >>> for flowchart 7 goto implementation of FetchFromOneSpans
 									 >>> in this file.
 								 */
-								int result = FetchFromOneSpans(N, start, end);
-								if (!result) {
+		int result = FetchFromOneSpans(N, start, end);
+		if (!result)
+		{
 
-												/*
+			/*
 													 >>> for flowchart 10 goto implementation of Populate method in this file.
 												 */
-												Populate();
-												result = FetchFromOneSpans(N, start, end);
-								}
-								return result;
-				}
+			Populate();
+			result = FetchFromOneSpans(N, start, end);
+		}
+		return result;
+	}
 
-				int CentralFreeList::FetchFromOneSpans(int N, void **start, void **end) {
+	int CentralFreeList::FetchFromOneSpans(int N, void **start, void **end)
+	{
 
-								/*
+		/*
 									 >>> flowchart 7. is central free list of small objects empty?
 									 >>> for flowchart 10 go back to FetchFromOneSpans method in this file.
 								 */
-								if (tcmalloc::DLL_IsEmpty(&nonempty_)) return 0;
-								Span* span = nonempty_.next;
+		if (tcmalloc::DLL_IsEmpty(&nonempty_))
+			return 0;
+		Span *span = nonempty_.next;
 
-								ASSERT(span->objects != NULL);
+		ASSERT(span->objects != NULL);
 
-								/*
+		/*
 									 >>> flowchart 8. fetch some objects for this size class from central
 									 >>> free list of small objects (shared by all threads). 
 									 >>> objects return in start and end pointers.
@@ -324,62 +373,67 @@ namespace tcmalloc {
 									 >>> through start and end pointers in RemoveRange method.
 									 >>> for flowchart 9 goto FetchFromCentralCache method in thread_cache.cc file.
 								 */
-								int result = 0;
-								void *prev, *curr;
-								curr = span->objects;
-								do {
-												prev = curr;
-												curr = *(reinterpret_cast<void**>(curr));
-								} while (++result < N && curr != NULL);
+		int result = 0;
+		void *prev, *curr;
+		curr = span->objects;
+		do
+		{
+			prev = curr;
+			curr = *(reinterpret_cast<void **>(curr));
+		} while (++result < N && curr != NULL);
 
-								if (curr == NULL) {
-												// Move to empty list
-												tcmalloc::DLL_Remove(span);
-												tcmalloc::DLL_Prepend(&empty_, span);
-												Event(span, 'E', 0);
-								}
+		if (curr == NULL)
+		{
+			// Move to empty list
+			tcmalloc::DLL_Remove(span);
+			tcmalloc::DLL_Prepend(&empty_, span);
+			Event(span, 'E', 0);
+		}
 
-								*start = span->objects;
-								*end = prev;
-								span->objects = curr;
-								SLL_SetNext(*end, NULL);
-								span->refcount += result;
-								counter_ -= result;
-								return result;
-				}
+		*start = span->objects;
+		*end = prev;
+		span->objects = curr;
+		SLL_SetNext(*end, NULL);
+		span->refcount += result;
+		counter_ -= result;
+		return result;
+	}
 
-				// Fetch memory from the system and add to the central cache freelist.
-				void CentralFreeList::Populate() {
-								// Release central list lock while operating on pageheap
-								lock_.Unlock();
-								const size_t npages = Static::sizemap()->class_to_pages(size_class_);
+	// Fetch memory from the system and add to the central cache freelist.
+	void CentralFreeList::Populate()
+	{
+		// Release central list lock while operating on pageheap
+		lock_.Unlock();
+		const size_t npages = Static::sizemap()->class_to_pages(size_class_);
 
-								Span* span = NULL;
-								{
-												int pageheap_rank;
-												SpinLockHolder h(Static::pageheap_lock(pageheap_rank));
-												/*
+		Span *span = NULL;
+		{
+			int pageheap_rank;
+			SpinLockHolder h(Static::pageheap_lock(pageheap_rank));
+			/*
 													 >>> for flowchart 10 goto New method implementation in page_heap.cc file.
 												 */
-				//								pid_t thread_id = syscall(__NR_gettid); 
-				//								Log(kLog, __FILE__, __LINE__,
-				//																"begin --> thread ", thread_id, " requests memory from pageheap number ", pageheap_rank
-				//									 );
-				//								auto start = std::chrono::high_resolution_clock::now();
-												span = Static::pageheap(pageheap_rank)->New(npages);
-				//								auto stop = std::chrono::high_resolution_clock::now();
-				//								auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(stop-start);
-												if (span) Static::pagemap()->RegisterSizeClass(span, size_class_);
-				//								Log(kLog, __FILE__, __LINE__,
-				//																"end --> thread ", thread_id, " recieved memory duration: ", duration.count()
-				//									 );
-								}
-								if (span == NULL) {
-												Log(kLog, __FILE__, __LINE__,
-																				"tcmalloc: allocation failed", npages << kPageShift);
-												lock_.Lock();
-												return;
-								}
+			//								pid_t thread_id = syscall(__NR_gettid);
+			//								Log(kLog, __FILE__, __LINE__,
+			//																"begin --> thread ", thread_id, " requests memory from pageheap number ", pageheap_rank
+			//									 );
+			//								auto start = std::chrono::high_resolution_clock::now();
+			span = Static::pageheap(pageheap_rank)->New(npages);
+			//								auto stop = std::chrono::high_resolution_clock::now();
+			//								auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(stop-start);
+			if (span)
+				Static::pagemap()->RegisterSizeClass(span, size_class_);
+			//								Log(kLog, __FILE__, __LINE__,
+			//																"end --> thread ", thread_id, " recieved memory duration: ", duration.count()
+			//									 );
+		}
+		if (span == NULL)
+		{
+			Log(kLog, __FILE__, __LINE__,
+				"tcmalloc: allocation failed", npages << kPageShift);
+			lock_.Lock();
+			return;
+		}
 		//						auto start1 = std::chrono::high_resolution_clock::now();
 		//						int random[1000];
 		//						srand((unsigned)time(NULL));
@@ -391,61 +445,66 @@ namespace tcmalloc {
 		//						Log(kLog, __FILE__, __LINE__,
 		//														"new added duration: " ,duration1.count()
 		//							 );
-								ASSERT(span->length == npages);
-								// Cache sizeclass info eagerly.  Locking is not necessary.
-								// (Instead of being eager, we could just replace any stale info
-								// about this span, but that seems to be no better in practice.)
-								for (int i = 0; i < npages; i++) {
-												Static::pagemap()->SetCachedSizeClass(span->start + i, size_class_);
-								}
+		ASSERT(span->length == npages);
+		// Cache sizeclass info eagerly.  Locking is not necessary.
+		// (Instead of being eager, we could just replace any stale info
+		// about this span, but that seems to be no better in practice.)
+		for (int i = 0; i < npages; i++)
+		{
+			Static::pagemap()->SetCachedSizeClass(span->start + i, size_class_);
+		}
 
-								// Split the block into pieces and add to the free-list
-								// TODO: coloring of objects to avoid cache conflicts?
+		// Split the block into pieces and add to the free-list
+		// TODO: coloring of objects to avoid cache conflicts?
 
-								/*
+		/*
 									 >>> flowchart 13. split run of pages into set of required size class objects
 								 */
-								void** tail = &span->objects;
-								char* ptr = reinterpret_cast<char*>(span->start << kPageShift);
-								char* limit = ptr + (npages << kPageShift);
-								const size_t size = Static::sizemap()->ByteSizeForClass(size_class_);
-								int num = 0;
-								while (ptr + size <= limit) {
-												*tail = ptr;
-												tail = reinterpret_cast<void**>(ptr);
-												ptr += size;
-												num++;
-								}
-								ASSERT(ptr <= limit);
-								*tail = NULL;
-								span->refcount = 0; // No sub-object in use yet
+		void **tail = &span->objects;
+		char *ptr = reinterpret_cast<char *>(span->start << kPageShift);
+		char *limit = ptr + (npages << kPageShift);
+		const size_t size = Static::sizemap()->ByteSizeForClass(size_class_);
+		int num = 0;
+		while (ptr + size <= limit)
+		{
+			*tail = ptr;
+			tail = reinterpret_cast<void **>(ptr);
+			ptr += size;
+			num++;
+		}
+		ASSERT(ptr <= limit);
+		*tail = NULL;
+		span->refcount = 0; // No sub-object in use yet
 
-								// Add span to list of non-empty spans
-								lock_.Lock();
+		// Add span to list of non-empty spans
+		lock_.Lock();
 
-								/*
+		/*
 									 >>> flowchart 14. place new objects in central free list of small objects
 								 */
-								tcmalloc::DLL_Prepend(&nonempty_, span);
-								++num_spans_;
-								counter_ += num;
-				}
+		tcmalloc::DLL_Prepend(&nonempty_, span);
+		++num_spans_;
+		counter_ += num;
+	}
 
-				int CentralFreeList::tc_length() {
-								SpinLockHolder h(&lock_);
-								return used_slots_ * Static::sizemap()->num_objects_to_move(size_class_);
-				}
+	int CentralFreeList::tc_length()
+	{
+		SpinLockHolder h(&lock_);
+		return used_slots_ * Static::sizemap()->num_objects_to_move(size_class_);
+	}
 
-				size_t CentralFreeList::OverheadBytes() {
-								SpinLockHolder h(&lock_);
-								if (size_class_ == 0) {  // 0 holds the 0-sized allocations
-												return 0;
-								}
-								const size_t pages_per_span = Static::sizemap()->class_to_pages(size_class_);
-								const size_t object_size = Static::sizemap()->class_to_size(size_class_);
-								ASSERT(object_size > 0);
-								const size_t overhead_per_span = (pages_per_span * kPageSize) % object_size;
-								return num_spans_ * overhead_per_span;
-				}
+	size_t CentralFreeList::OverheadBytes()
+	{
+		SpinLockHolder h(&lock_);
+		if (size_class_ == 0)
+		{ // 0 holds the 0-sized allocations
+			return 0;
+		}
+		const size_t pages_per_span = Static::sizemap()->class_to_pages(size_class_);
+		const size_t object_size = Static::sizemap()->class_to_size(size_class_);
+		ASSERT(object_size > 0);
+		const size_t overhead_per_span = (pages_per_span * kPageSize) % object_size;
+		return num_spans_ * overhead_per_span;
+	}
 
-}  // namespace tcmalloc
+} // namespace tcmalloc
