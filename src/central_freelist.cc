@@ -86,11 +86,55 @@ namespace tcmalloc
 
 	void CentralFreeList::ReleaseListToSpans(void *start)
 	{
-		while (start)
+		Span *span = MapObjectToSpan(start);
+		ASSERT(span != NULL);
+		ASSERT(span->refcount > 0);
+
+		// If span is empty, move it to non-empty list
+		if (span->objects == NULL)
 		{
-			void *next = SLL_Next(start);
-			ReleaseToSpans(start);
-			start = next;
+			tcmalloc::DLL_Remove(span);
+			tcmalloc::DLL_Prepend(&nonempty_, span);
+			Event(span, 'N', 0);
+		}
+
+		counter_++;
+
+		void *temp_start = start;
+		while (temp_start)
+		{
+			void *next = SLL_Next(temp_start);
+			temp_start = next;
+			span->refcount--;
+		}
+
+		if (span->refcount == 0)
+		{
+			Event(span, '#', 0);
+			counter_ -= ((span->length << kPageShift) /
+						 Static::sizemap()->ByteSizeForClass(span->sizeclass));
+			tcmalloc::DLL_Remove(span);
+			--num_spans_;
+
+			// Release central list lock while operating on pageheap
+			lock_.Unlock();
+			{
+				int pageheap_rank;
+				SpinLockHolder h(Static::pageheap_lock(pageheap_rank));
+				Static::pageheap(pageheap_rank)->AppendSpantoPageHeap(span);
+			}
+			lock_.Lock();
+		}
+		else
+		{
+			void *temp_start1 = start;
+			while (temp_start1)
+			{
+				*(reinterpret_cast<void **>(temp_start1)) = span->objects;
+				span->objects = temp_start1;
+				void *next = SLL_Next(temp_start1);
+				temp_start1 = next;
+			}
 		}
 	}
 
@@ -112,58 +156,6 @@ namespace tcmalloc
 
 	void CentralFreeList::ReleaseToSpans(void *object)
 	{
-
-		Span *span = MapObjectToSpan(object);
-		ASSERT(span != NULL);
-		ASSERT(span->refcount > 0);
-
-		// If span is empty, move it to non-empty list
-		if (span->objects == NULL)
-		{
-			tcmalloc::DLL_Remove(span);
-			tcmalloc::DLL_Prepend(&nonempty_, span);
-			Event(span, 'N', 0);
-		}
-
-		// The following check is expensive, so it is disabled by default
-		if (false)
-		{
-			// Check that object does not occur in list
-			int got = 0;
-			for (void *p = span->objects; p != NULL; p = *((void **)p))
-			{
-				ASSERT(p != object);
-				got++;
-			}
-			ASSERT(got + span->refcount ==
-				   (span->length << kPageShift) /
-					   Static::sizemap()->ByteSizeForClass(span->sizeclass));
-		}
-
-		counter_++;
-		span->refcount--;
-		if (span->refcount == 0)
-		{
-			Event(span, '#', 0);
-			counter_ -= ((span->length << kPageShift) /
-						 Static::sizemap()->ByteSizeForClass(span->sizeclass));
-			tcmalloc::DLL_Remove(span);
-			--num_spans_;
-
-			// Release central list lock while operating on pageheap
-			lock_.Unlock();
-			{
-				int pageheap_rank;
-				SpinLockHolder h(Static::pageheap_lock(pageheap_rank));
-				Static::pageheap(pageheap_rank)->AppendSpantoPageHeap(span);
-			}
-			lock_.Lock();
-		}
-		else
-		{
-			*(reinterpret_cast<void **>(object)) = span->objects;
-			span->objects = object;
-		}
 	}
 
 	bool CentralFreeList::EvictRandomSizeClass(
