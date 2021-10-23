@@ -208,7 +208,7 @@ namespace tcmalloc
     class FreeListInventory
     {
     private:
-      map<Span *, FreeList *> freelists;
+      std::map<Span *, FreeList *> freelists;
       uint32_t sc_length_;
       int32_t sc_size_;
       uint32_t sc_max_length_;
@@ -284,7 +284,7 @@ namespace tcmalloc
 
       bool SCPopRange(int N, void **start, void **end)
       {
-        map<Span *, FreeList *>::iterator it;
+        std::map<Span *, FreeList *>::iterator it;
         for (it = freelists.begin(); it != freelists.end(); it++)
         {
           if (it->second->length() >= N)
@@ -301,7 +301,7 @@ namespace tcmalloc
 
       bool SCTryPop(void **rv)
       {
-        map<Span *, FreeList *>::iterator it;
+        std::map<Span *, FreeList *>::iterator it;
         for (it = freelists.begin(); it != freelists.end(); it++)
         {
           if (it->second->length() > 0)
@@ -318,7 +318,7 @@ namespace tcmalloc
 
       void *SCPop()
       {
-        map<Span *, FreeList *>::iterator it;
+        std::map<Span *, FreeList *>::iterator it;
         for (it = freelists.begin(); it != freelists.end(); it++)
         {
           if (it->second->length() > 0)
